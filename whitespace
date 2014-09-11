@@ -1,0 +1,178 @@
+#!/usr/bin/perl -w
+
+=comment
+
+Utility to cleanup whitespace issues in text files.
+
+Copyright (c) 2011, Vadim Mikhailov.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+=cut
+
+use strict;
+use warnings;
+
+use Encode;
+use Encode::Guess;
+use FindBin qw($RealBin $Script);
+use File::Find;
+use Getopt::Long;
+
+my @getopt_args = (
+    'help',
+);
+
+# define default options:
+my %options = (
+    hdrsize =>      1_000,  # test at least that many bytes for text
+    maxsize => 10_000_000,  # skip large files
+);
+
+Getopt::Long::config("noignorecase", "nobundling");
+
+Usage() unless GetOptions(\%options, @getopt_args);
+Usage() if $options{help};
+Usage() unless @ARGV;
+my $changed_files = 0;
+my $changed_items = 0;
+my $warning_count = 0;
+
+for my $element (@ARGV) {
+    for my $item (glob $element) {
+        if (-f $item) {
+            CleanFile($item);
+        } elsif (-d $item) {
+            File::Find::find(
+                {   wanted => sub {
+                        return unless -f $File::Find::name;
+                        return if $File::Find::dir =~ m{\.svn|\.git};
+                        CleanFile($File::Find::name);
+                    },
+                    no_chdir => 1,
+                },
+                $item,
+            );
+        }
+    }
+}
+
+print "\n";
+if ($changed_files) {
+    print "Changed $changed_files files, total $changed_items problems fixed!\n";
+}
+if ($warning_count) {
+    print "Detected $warning_count whitespace warnings!\n";
+}
+if (not $changed_files and not $warning_count) {
+    print "No problems detected!\n";
+}
+
+sub CleanFile {
+    my ($filename) = @_;
+    return 0 if -B $filename or not -T $filename;
+    my $filesize = -s $filename or 0;
+    return 0 if $filesize > $options{maxsize};
+    my $hdrsize = 4096;
+    if ($hdrsize > $filesize) {
+        $hdrsize = $filesize;
+    }
+    my $len;
+    my $contents;
+    open FILE, $filename;
+    binmode FILE;
+    $len = read FILE, $contents, $hdrsize, 0;
+    close FILE;
+    return 0 unless defined $len and $len eq $hdrsize;
+    my $enc;
+    $enc = guess_encoding($contents);
+    return 0 unless ref $enc and $enc->mime_name =~ /ascii|utf-8/i;
+
+    if ($hdrsize < $filesize) {
+        open FILE, $filename;
+        binmode FILE;
+        $len = read FILE, $contents, $filesize, 0;
+        close FILE;
+        return 0 unless defined $len and $len eq $filesize;
+        $enc = guess_encoding($contents);
+        return 0 unless ref $enc and $enc->mime_name =~ /ascii|utf-8/i;
+    }
+
+    my $newtext = $contents;
+    print "Checking $filename\n";
+    my $crlf_fixes  = scalar($newtext =~ s/\r\n/\n/sg);
+    my $cr_fixes    = scalar($newtext =~ s/\r/\n/sg);
+    my $trail_fixes = scalar($newtext =~ s/[ \t]+$//mg);
+    my $lasteol_fix = 0;
+    if ($newtext !~ /\n$/s) {
+        $newtext .= "\n";
+        $lasteol_fix = 1;
+    }
+    my $multeol_fix = 0;
+    if ($newtext =~ /\n\n$/s) {
+        $newtext =~ s/\n+$/\n/s;
+        $multeol_fix = 1;
+    }
+    if ($newtext =~ / \t/) {
+        print "   Warning: spaces before tabs are detected!\n";
+        $warning_count++;
+    }
+    if ($contents ne $newtext) {
+        open FILE, ">:raw", $filename;
+        if (-w FILE) {
+            print FILE $newtext;
+            print "  Replaced $crlf_fixes lines with CRLF to LF\n"        if $crlf_fixes;
+            print "  Replaced $cr_fixes lines with CR to LF\n"            if $cr_fixes;
+            print "  Removed trailing whitespace in $trail_fixes lines\n" if $trail_fixes;
+            print "  Added missing last newline\n"                        if $lasteol_fix;
+            print "  Removed multiple empty lines at the end of file\n"   if $multeol_fix;
+            $changed_files++;
+            close FILE;
+        } else {
+            print "Warning: cannot open $filename for writing. File is not fixed!\n";
+        }
+    }
+    my $changes = $crlf_fixes + $cr_fixes + $trail_fixes + $lasteol_fix;
+    $changed_items += $changes;
+    return $changes;
+}
+
+sub Usage {
+    print <<EOT;
+Usage: $Script [options] [file/dir...]
+
+Normalize whitespace in text file(s).
+It works recursively if directory name is specified.
+
+Following actions are performed for every file:
+- Check if file is indeed text file - binary files are skipped
+- All newlines are converted to Unix format [Windows(CRLF) or Mac(CR) to Unix(LF)]
+- Trailing whitespace (space and tab characters) is removed in every line
+- Make sure that last line is ending with newline character
+- At the end of file, multiple new lines are compressed into just one
+- Warn if space before tab was detected
+
+Note: all edits are done in place - no backup copies are created.
+EOT
+    exit 1;
+}
